@@ -13,7 +13,7 @@ Blender add-on that displays a stable eye-level (horizon) guide inside the camer
 
 インストール方法：
 
-1. Releasesからel-view.zipをダウンロード  
+1. Releasesからel-view.zipを [✨Download✨](https://github.com/stechdrive/el-view/releases/download/v1.1.0/el-view.zip)
 2. Blender → *編集 > プリファレンス > アドオン > インストール*  
 3. ZIP を選択  
 4. アドオンを有効化  
@@ -32,7 +32,7 @@ Blender add-on that displays a stable eye-level (horizon) guide inside the camer
 
 Installation:
 
-1. Download el-view.zip  
+1. [✨Download✨](https://github.com/stechdrive/el-view/releases/download/v1.1.0/el-view.zip) el-view.zip  
 2. Blender → *Edit > Preferences > Add-ons > Install*  
 3. Select the ZIP  
 4. Enable the add-on  
