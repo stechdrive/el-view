@@ -1,0 +1,21 @@
+schema_version = "1.0.0"
+
+id = "el_view"
+version = "2.0.0"
+name = "EL View"
+tagline = "Display eye level line on camera view and render output"
+maintainer = "stechdrive"
+type = "add-on"
+
+website = "https://github.com/stechdrive/el-view"
+
+blender_version_min = "4.2.0"
+
+license = [
+    "SPDX:MIT",
+]
+
+tags = ["3D View"]
+
+[permissions]
+# No special permissions required
