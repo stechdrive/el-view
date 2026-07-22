@@ -27,8 +27,8 @@
 bl_info = {
     "name": "EL View",
     "author": "stechdrive",
-    "version": (2, 0, 0),
-    "blender": (4, 0, 0),
+    "version": (2, 1, 0),
+    "blender": (4, 2, 0),
     "location": "3D View > N Panel > View > EL View",
     "description": "Display eye level (horizon) line on camera view and render output",
     "category": "3D View",
@@ -38,6 +38,7 @@ bl_info = {
 import bpy
 import gpu
 from gpu_extras.batch import batch_for_shader
+from bpy.app.handlers import persistent
 from bpy.types import PropertyGroup, Panel
 from bpy.props import BoolProperty, FloatProperty, FloatVectorProperty, PointerProperty
 from mathutils import Vector, Matrix
@@ -47,6 +48,14 @@ from typing import Optional, Tuple
 # Property Group
 # ---------------------------------------------------------------------------
 
+def _settings_update(_self, context) -> None:
+    """Keep the render compositor ready when an EL View setting changes."""
+    sync = globals().get("_sync_scene_overlay")
+    scene = getattr(context, "scene", None) if context is not None else None
+    if sync is not None and scene is not None:
+        sync(scene)
+
+
 class ELViewSettings(PropertyGroup):
     """Settings for the eye level line overlay."""
 
@@ -54,6 +63,7 @@ class ELViewSettings(PropertyGroup):
         name="Enable",
         default=False,
         description="Show eye level line in camera view",
+        update=_settings_update,
     )
     color: FloatVectorProperty(
         name="Color",
@@ -63,6 +73,7 @@ class ELViewSettings(PropertyGroup):
         min=0.0,
         max=1.0,
         description="Line color and opacity",
+        update=_settings_update,
     )
     line_width: FloatProperty(
         name="Line Width",
@@ -70,11 +81,13 @@ class ELViewSettings(PropertyGroup):
         min=1.0,
         max=10.0,
         description="Line thickness in pixels",
+        update=_settings_update,
     )
     render_overlay: BoolProperty(
         name="Render Overlay",
         default=True,
         description="Composite eye level line onto render output",
+        update=_settings_update,
     )
 
 
@@ -227,17 +240,224 @@ def _draw_callback() -> None:
 # ---------------------------------------------------------------------------
 #
 # Render Result pixels are not accessible from Python (Blender #53768).
-# Instead, we inject a temporary Image + Alpha Over node into the
-# compositor tree just before rendering.  The nodes are removed once
-# the render finishes or is cancelled.
+# Instead, we inject an Image + Alpha Over node into the compositor tree.
+# Blender 5.x compiles that tree before render handlers run, so the runtime
+# nodes stay prepared while Render Overlay is enabled.  They are removed and
+# the user's original links are restored when the option/add-on is disabled.
 # ---------------------------------------------------------------------------
 
 _OVERLAY_IMG_NAME: str = "__elview_overlay__"
 _OVERLAY_NODE_IMG: str = "__elview_img_node__"
 _OVERLAY_NODE_MIX: str = "__elview_alpha_node__"
+_RUNTIME_TREE_PROP: str = "_elview_runtime_tree"
+_RUNTIME_NODE_PROP: str = "_elview_runtime_created"
+_RUNTIME_INTERFACE_PROP: str = "_elview_runtime_interface_socket"
+_USE_NODES_WAS_OFF_PROP: str = "_elview_use_nodes_was_off"
 
-# Stores state needed to restore the compositor after render.
-_comp_cleanup: Optional[dict] = None
+# Runtime state used to restore each scene's compositor when EL View is
+# disabled or the add-on is unloaded.
+_comp_cleanups: dict[int, dict] = {}
+
+
+def _scene_key(scene: bpy.types.Scene) -> int:
+    return scene.as_pointer()
+
+
+def _get_compositor_cleanup(scene: bpy.types.Scene) -> Optional[dict]:
+    return _comp_cleanups.get(_scene_key(scene))
+
+
+def _overlay_image_name(scene: bpy.types.Scene) -> str:
+    return f"{_OVERLAY_IMG_NAME}_{_scene_key(scene):x}"
+
+
+def _remove_runtime_images(images) -> None:
+    for image in images:
+        if image is not None and image.name.startswith(_OVERLAY_IMG_NAME):
+            try:
+                bpy.data.images.remove(image)
+            except Exception:
+                pass
+
+
+def _remove_saved_runtime_nodes(tree: bpy.types.NodeTree) -> None:
+    """Remove EL View nodes loaded from a saved file and restore their links."""
+    image_nodes = [
+        node for node in tree.nodes
+        if node.name.startswith(_OVERLAY_NODE_IMG) or node.label == "EL View Overlay"
+    ]
+    alpha_nodes = [
+        node for node in tree.nodes
+        if node.name.startswith(_OVERLAY_NODE_MIX) or node.label == "EL View Mix"
+    ]
+    images = [node.image for node in image_nodes if hasattr(node, "image")]
+
+    for alpha_node in alpha_nodes:
+        original_from = None
+        for input_socket in alpha_node.inputs:
+            for link in input_socket.links:
+                if link.from_node not in image_nodes:
+                    original_from = link.from_socket
+                    break
+            if original_from is not None:
+                break
+        destinations = [
+            link.to_socket
+            for output_socket in alpha_node.outputs
+            for link in output_socket.links
+        ]
+        try:
+            tree.nodes.remove(alpha_node)
+        except Exception:
+            continue
+        if original_from is not None:
+            for destination in destinations:
+                try:
+                    tree.links.new(original_from, destination)
+                except Exception:
+                    pass
+
+    for image_node in image_nodes:
+        try:
+            tree.nodes.remove(image_node)
+        except Exception:
+            pass
+
+    for node in list(tree.nodes):
+        if bool(node.get(_RUNTIME_NODE_PROP, False)):
+            try:
+                tree.nodes.remove(node)
+            except Exception:
+                pass
+    interface_identifier = tree.get(_RUNTIME_INTERFACE_PROP, "")
+    if interface_identifier and hasattr(tree, "interface"):
+        for item in list(tree.interface.items_tree):
+            if getattr(item, "identifier", "") == interface_identifier:
+                try:
+                    tree.interface.remove(item)
+                except Exception:
+                    pass
+                break
+        try:
+            del tree[_RUNTIME_INTERFACE_PROP]
+        except Exception:
+            pass
+    _remove_runtime_images(images)
+
+
+def _remove_saved_runtime(scene: bpy.types.Scene,
+                          restore_use_nodes: bool = False) -> None:
+    """Clean runtime data that survived in a saved blend file."""
+    if hasattr(scene, "compositing_node_group"):
+        tree = scene.compositing_node_group
+        if tree is not None and bool(tree.get(_RUNTIME_TREE_PROP, False)):
+            images = [
+                node.image for node in tree.nodes
+                if node.type == 'IMAGE' and getattr(node, "image", None) is not None
+            ]
+            scene.compositing_node_group = None
+            try:
+                bpy.data.node_groups.remove(tree)
+            except Exception:
+                pass
+            _remove_runtime_images(images)
+        elif tree is not None:
+            _remove_saved_runtime_nodes(tree)
+    else:
+        tree = getattr(scene, "node_tree", None)
+        if tree is not None:
+            _remove_saved_runtime_nodes(tree)
+
+    if restore_use_nodes and bool(scene.get(_USE_NODES_WAS_OFF_PROP, False)):
+        if hasattr(scene, "use_nodes"):
+            scene.use_nodes = False
+        try:
+            del scene[_USE_NODES_WAS_OFF_PROP]
+        except Exception:
+            pass
+
+
+def _ensure_compositor_tree(scene: bpy.types.Scene) -> Tuple[Optional[bpy.types.NodeTree], bool, bool]:
+    """Return the scene compositor tree and how it must be restored.
+
+    Blender 4.x owns the compositor tree directly on ``Scene.node_tree``.
+    Blender 5.0 moved it to the assignable
+    ``Scene.compositing_node_group`` data-block.  Feature detection keeps the
+    same add-on package compatible with both APIs.
+    """
+    use_nodes_was = bool(getattr(scene, "use_nodes", False))
+    if bool(scene.get(_USE_NODES_WAS_OFF_PROP, False)):
+        use_nodes_was = False
+    if hasattr(scene, "use_nodes") and not bool(scene.use_nodes):
+        scene.use_nodes = True
+    if not use_nodes_was:
+        scene[_USE_NODES_WAS_OFF_PROP] = True
+
+    if hasattr(scene, "compositing_node_group"):
+        tree = scene.compositing_node_group
+        created_tree = tree is None
+        if created_tree:
+            tree = bpy.data.node_groups.new(
+                f"{scene.name} EL View Compositor", 'CompositorNodeTree'
+            )
+            tree[_RUNTIME_TREE_PROP] = True
+            scene.compositing_node_group = tree
+        return tree, use_nodes_was, created_tree
+
+    return getattr(scene, "node_tree", None), use_nodes_was, False
+
+
+def _ensure_compositor_output(tree: bpy.types.NodeTree,
+                              use_group_output: bool) -> Tuple[
+                                  bpy.types.Node,
+                                  bpy.types.NodeSocket,
+                                  bool,
+                                  Optional[object],
+                              ]:
+    """Return the active final-output node and its image input socket."""
+    created_output_node = False
+    created_interface_socket = None
+
+    if use_group_output:
+        output_node = next(
+            (
+                node for node in tree.nodes
+                if node.type == 'GROUP_OUTPUT' and getattr(node, "is_active_output", True)
+            ),
+            None,
+        )
+        if output_node is None:
+            output_node = next(
+                (node for node in tree.nodes if node.type == 'GROUP_OUTPUT'),
+                None,
+            )
+        if output_node is None:
+            output_node = tree.nodes.new('NodeGroupOutput')
+            output_node[_RUNTIME_NODE_PROP] = True
+            created_output_node = True
+
+        output_input = output_node.inputs.get('Image')
+        if output_input is None:
+            created_interface_socket = tree.interface.new_socket(
+                name='Image', in_out='OUTPUT', socket_type='NodeSocketColor'
+            )
+            tree[_RUNTIME_INTERFACE_PROP] = created_interface_socket.identifier
+            output_input = output_node.inputs.get('Image')
+    else:
+        output_node = next(
+            (node for node in tree.nodes if node.type == 'COMPOSITE'),
+            None,
+        )
+        if output_node is None:
+            output_node = tree.nodes.new('CompositorNodeComposite')
+            output_node[_RUNTIME_NODE_PROP] = True
+            created_output_node = True
+        output_input = output_node.inputs.get('Image')
+
+    if output_input is None:
+        raise RuntimeError("EL View could not find the compositor image output")
+
+    return output_node, output_input, created_output_node, created_interface_socket
 
 
 def _create_overlay_image(scene: bpy.types.Scene, ndc_y: float) -> Optional[bpy.types.Image]:
@@ -261,12 +481,13 @@ def _create_overlay_image(scene: bpy.types.Scene, ndc_y: float) -> Optional[bpy.
         return None
 
     # Reuse or create image
-    img = bpy.data.images.get(_OVERLAY_IMG_NAME)
+    img_name = _overlay_image_name(scene)
+    img = bpy.data.images.get(img_name)
     if img is not None and (img.size[0] != img_w or img.size[1] != img_h):
         bpy.data.images.remove(img)
         img = None
     if img is None:
-        img = bpy.data.images.new(_OVERLAY_IMG_NAME, img_w, img_h,
+        img = bpy.data.images.new(img_name, img_w, img_h,
                                   alpha=True, float_buffer=True)
         img.colorspace_settings.name = 'Linear Rec.709'
 
@@ -297,137 +518,262 @@ def _inject_compositor_nodes(scene: bpy.types.Scene,
 
     Returns ``True`` on success.
     """
-    global _comp_cleanup
+    existing = _get_compositor_cleanup(scene)
+    if existing is not None:
+        _teardown_compositor(scene)
 
-    use_nodes_was: bool = scene.use_nodes
-    if not scene.use_nodes:
-        scene.use_nodes = True
-
-    tree = scene.node_tree
-
-    # Find Composite output node (create if missing)
-    comp_node = None
-    for node in tree.nodes:
-        if node.type == 'COMPOSITE':
-            comp_node = node
-            break
-    if comp_node is None:
-        comp_node = tree.nodes.new('CompositorNodeComposite')
-
-    # Find the socket currently feeding the Composite/Image input
-    original_from = None
-    for link in tree.links:
-        if link.to_node == comp_node and link.to_socket == comp_node.inputs['Image']:
-            original_from = link.from_socket
-            tree.links.remove(link)
-            break
-
-    # Fallback: look for a Render Layers node
-    if original_from is None:
-        for node in tree.nodes:
-            if node.type == 'R_LAYERS':
-                original_from = node.outputs['Image']
-                break
-    if original_from is None:
+    tree, use_nodes_was, created_tree = _ensure_compositor_tree(scene)
+    if tree is None:
+        if not use_nodes_was and hasattr(scene, "use_nodes"):
+            scene.use_nodes = False
+            try:
+                del scene[_USE_NODES_WAS_OFF_PROP]
+            except Exception:
+                pass
         return False
 
-    # Image node → our overlay
-    img_node = tree.nodes.new('CompositorNodeImage')
-    img_node.name = _OVERLAY_NODE_IMG
-    img_node.label = "EL View Overlay"
-    img_node.image = overlay_img
-    img_node.location = (comp_node.location.x - 400, comp_node.location.y - 200)
-
-    # Alpha Over node
-    alpha_node = tree.nodes.new('CompositorNodeAlphaOver')
-    alpha_node.name = _OVERLAY_NODE_MIX
-    alpha_node.label = "EL View Mix"
-    alpha_node.location = (comp_node.location.x - 200, comp_node.location.y)
-
-    # Wire:  render → AlphaOver(bg) ;  overlay → AlphaOver(fg) ;  AlphaOver → Composite
-    tree.links.new(original_from, alpha_node.inputs[1])
-    tree.links.new(img_node.outputs['Image'], alpha_node.inputs[2])
-    tree.links.new(alpha_node.outputs['Image'], comp_node.inputs['Image'])
-
-    _comp_cleanup = {
+    use_group_output = hasattr(scene, "compositing_node_group")
+    info = {
+        'scene': scene,
+        'tree': tree,
         'use_nodes_was': use_nodes_was,
-        'original_from': original_from,
-        'comp_node': comp_node,
+        'created_tree': created_tree,
+        'created_output_node': False,
+        'created_interface_socket': None,
+        'created_render_layers_node': False,
+        'output_node': None,
+        'output_input': None,
+        'original_from': None,
+        'original_link_was_present': False,
+        'img_node': None,
+        'alpha_node': None,
+        'overlay_img': overlay_img,
+        'signature': None,
     }
-    return True
+    _comp_cleanups[_scene_key(scene)] = info
+
+    try:
+        output_node, output_input, created_output_node, created_interface_socket = (
+            _ensure_compositor_output(tree, use_group_output)
+        )
+        info.update({
+            'output_node': output_node,
+            'output_input': output_input,
+            'created_output_node': created_output_node,
+            'created_interface_socket': created_interface_socket,
+        })
+
+        # Preserve exactly the link that was feeding the final image output.
+        original_from = None
+        for link in list(tree.links):
+            if link.to_node == output_node and link.to_socket == output_input:
+                original_from = link.from_socket
+                info['original_from'] = original_from
+                info['original_link_was_present'] = True
+                tree.links.remove(link)
+                break
+
+        # A fresh or currently unlinked compositor still needs the render as
+        # the background beneath the guide line.
+        if original_from is None:
+            render_layers = next(
+                (node for node in tree.nodes if node.type == 'R_LAYERS'),
+                None,
+            )
+            if render_layers is None:
+                render_layers = tree.nodes.new('CompositorNodeRLayers')
+                render_layers[_RUNTIME_NODE_PROP] = True
+                info['created_render_layers_node'] = True
+            original_from = render_layers.outputs.get('Image')
+            info['render_layers_node'] = render_layers
+        if original_from is None:
+            raise RuntimeError("EL View could not find the rendered image socket")
+
+        # Image node → our transparent guide image
+        img_node = tree.nodes.new('CompositorNodeImage')
+        img_node.name = _OVERLAY_NODE_IMG
+        img_node.label = "EL View Overlay"
+        img_node.image = overlay_img
+        img_node.location = (output_node.location.x - 400, output_node.location.y - 200)
+        info['img_node'] = img_node
+
+        # Alpha Over node
+        alpha_node = tree.nodes.new('CompositorNodeAlphaOver')
+        alpha_node.name = _OVERLAY_NODE_MIX
+        alpha_node.label = "EL View Mix"
+        alpha_node.location = (output_node.location.x - 200, output_node.location.y)
+        info['alpha_node'] = alpha_node
+
+        background_input = alpha_node.inputs.get('Background') or alpha_node.inputs[1]
+        foreground_input = alpha_node.inputs.get('Foreground') or alpha_node.inputs[2]
+
+        # Wire: render → background; overlay → foreground; result → final output.
+        tree.links.new(original_from, background_input)
+        tree.links.new(img_node.outputs['Image'], foreground_input)
+        tree.links.new(alpha_node.outputs['Image'], output_input)
+        return True
+    except Exception as exc:
+        print(f"EL View: failed to inject compositor nodes: {exc}")
+        _teardown_compositor(scene)
+        return False
 
 
 def _teardown_compositor(scene: bpy.types.Scene) -> None:
     """Remove temporary nodes / image and restore the original compositor."""
-    global _comp_cleanup
-
-    if _comp_cleanup is None:
+    info = _comp_cleanups.pop(_scene_key(scene), None)
+    if info is None:
         return
 
-    info = _comp_cleanup
-    _comp_cleanup = None
+    tree = info['tree']
+    owner_scene = info['scene']
 
-    tree = scene.node_tree
-    if tree is None:
-        return
+    if info['created_tree']:
+        try:
+            if owner_scene.compositing_node_group == tree:
+                owner_scene.compositing_node_group = None
+            bpy.data.node_groups.remove(tree)
+        except Exception:
+            pass
+    else:
+        # Removing the two temporary nodes also removes their temporary links.
+        for key in ('alpha_node', 'img_node'):
+            node = info.get(key)
+            if node is not None:
+                try:
+                    tree.nodes.remove(node)
+                except Exception:
+                    pass
 
-    # Remove our nodes
-    for name in (_OVERLAY_NODE_MIX, _OVERLAY_NODE_IMG):
-        node = tree.nodes.get(name)
-        if node is not None:
-            tree.nodes.remove(node)
+        # Restore only a link that existed before EL View touched the tree.
+        if info['original_link_was_present']:
+            try:
+                tree.links.new(info['original_from'], info['output_input'])
+            except Exception:
+                pass
 
-    # Restore original link
-    try:
-        tree.links.new(info['original_from'], info['comp_node'].inputs['Image'])
-    except Exception:
-        pass
+        if info.get('created_render_layers_node'):
+            try:
+                tree.nodes.remove(info['render_layers_node'])
+            except Exception:
+                pass
+        if info.get('created_output_node'):
+            try:
+                tree.nodes.remove(info['output_node'])
+            except Exception:
+                pass
+        interface_socket = info.get('created_interface_socket')
+        if interface_socket is not None:
+            try:
+                tree.interface.remove(interface_socket)
+            except Exception:
+                pass
 
-    # Restore use_nodes flag
-    if not info['use_nodes_was']:
-        scene.use_nodes = False
+    # Restore the scene's compositor-enable state on both APIs.
+    if not info['use_nodes_was'] and hasattr(owner_scene, "use_nodes"):
+        owner_scene.use_nodes = False
+        try:
+            del owner_scene[_USE_NODES_WAS_OFF_PROP]
+        except Exception:
+            pass
 
     # Remove temp image
-    img = bpy.data.images.get(_OVERLAY_IMG_NAME)
+    img = info.get('overlay_img')
     if img is not None:
-        bpy.data.images.remove(img)
+        try:
+            bpy.data.images.remove(img)
+        except Exception:
+            pass
 
 
-# ---- render handlers ----
+# ---- compositor synchronisation / render handlers ----
 
-def _on_render_pre(scene, *_args) -> None:
-    """Before each frame: create / update overlay and inject compositor nodes."""
+def _sync_scene_overlay(scene: bpy.types.Scene) -> None:
+    """Prepare or update the persistent runtime compositor for *scene*.
+
+    Blender 5.x compiles its compositor graph before ``render_init`` and
+    ``render_pre`` run.  The graph therefore has to be ready while the scene is
+    edited; the render handlers remain as a final per-frame value refresh.
+    """
     settings = getattr(scene, "elview_settings", None)
     if settings is None or not settings.enable or not settings.render_overlay:
+        if _get_compositor_cleanup(scene) is not None:
+            _teardown_compositor(scene)
+        else:
+            _remove_saved_runtime(scene, restore_use_nodes=True)
         return
 
     ndc_y = _calc_eye_level_ndc_y_for_render(scene)
     if ndc_y is None:
+        if _get_compositor_cleanup(scene) is not None:
+            _teardown_compositor(scene)
+        else:
+            _remove_saved_runtime(scene, restore_use_nodes=True)
         return
+
+    render = scene.render
+    signature = (
+        round(ndc_y, 9),
+        render.resolution_x,
+        render.resolution_y,
+        render.resolution_percentage,
+        round(settings.line_width, 4),
+        tuple(round(value, 6) for value in settings.color),
+    )
+    info = _get_compositor_cleanup(scene)
+    if info is not None and info.get('signature') == signature:
+        return
+    if info is None:
+        _remove_saved_runtime(scene)
 
     overlay = _create_overlay_image(scene, ndc_y)
     if overlay is None:
+        _teardown_compositor(scene)
         return
 
-    if _comp_cleanup is None:
-        _inject_compositor_nodes(scene, overlay)
+    if info is None:
+        if not _inject_compositor_nodes(scene, overlay):
+            try:
+                bpy.data.images.remove(overlay)
+            except Exception:
+                pass
+            return
+        info = _get_compositor_cleanup(scene)
     else:
-        # Animation: just update the Image node's image reference
-        tree = scene.node_tree
-        if tree is not None:
-            node = tree.nodes.get(_OVERLAY_NODE_IMG)
-            if node is not None:
-                node.image = overlay
+        node = info.get('img_node')
+        if node is not None:
+            node.image = overlay
+        info['overlay_img'] = overlay
+
+    if info is not None:
+        info['signature'] = signature
 
 
-def _on_render_complete(scene, *_args) -> None:
-    """After render finishes: clean up compositor."""
-    _teardown_compositor(scene)
+@persistent
+def _on_render_init(scene, *_args) -> None:
+    """Refresh the graph before rendering (fallback for scripted workflows)."""
+    _sync_scene_overlay(scene)
 
 
-def _on_render_cancel(scene, *_args) -> None:
-    """If render is cancelled: clean up compositor."""
-    _teardown_compositor(scene)
+@persistent
+def _on_render_pre(scene, *_args) -> None:
+    """Refresh the overlay for the evaluated animation frame."""
+    _sync_scene_overlay(scene)
+
+
+@persistent
+def _on_frame_change_post(scene, *_args) -> None:
+    _sync_scene_overlay(scene)
+
+
+@persistent
+def _on_depsgraph_update_post(scene, *_args) -> None:
+    _sync_scene_overlay(scene)
+
+
+@persistent
+def _on_load_post(_unused) -> None:
+    for scene in bpy.data.scenes:
+        _sync_scene_overlay(scene)
 
 
 # ---------------------------------------------------------------------------
@@ -482,18 +828,32 @@ def register() -> None:
     )
 
     bpy.app.handlers.render_pre.append(_on_render_pre)
-    bpy.app.handlers.render_complete.append(_on_render_complete)
-    bpy.app.handlers.render_cancel.append(_on_render_cancel)
+    bpy.app.handlers.render_init.append(_on_render_init)
+    bpy.app.handlers.frame_change_post.append(_on_frame_change_post)
+    bpy.app.handlers.depsgraph_update_post.append(_on_depsgraph_update_post)
+    bpy.app.handlers.load_post.append(_on_load_post)
+
+    for scene in bpy.data.scenes:
+        _sync_scene_overlay(scene)
 
 
 def unregister() -> None:
     """Unregister the addon classes, properties, and handlers."""
     global _draw_handle
 
-    if _on_render_cancel in bpy.app.handlers.render_cancel:
-        bpy.app.handlers.render_cancel.remove(_on_render_cancel)
-    if _on_render_complete in bpy.app.handlers.render_complete:
-        bpy.app.handlers.render_complete.remove(_on_render_complete)
+    for info in list(_comp_cleanups.values()):
+        _teardown_compositor(info['scene'])
+    for scene in bpy.data.scenes:
+        _remove_saved_runtime(scene, restore_use_nodes=True)
+
+    if _on_load_post in bpy.app.handlers.load_post:
+        bpy.app.handlers.load_post.remove(_on_load_post)
+    if _on_depsgraph_update_post in bpy.app.handlers.depsgraph_update_post:
+        bpy.app.handlers.depsgraph_update_post.remove(_on_depsgraph_update_post)
+    if _on_frame_change_post in bpy.app.handlers.frame_change_post:
+        bpy.app.handlers.frame_change_post.remove(_on_frame_change_post)
+    if _on_render_init in bpy.app.handlers.render_init:
+        bpy.app.handlers.render_init.remove(_on_render_init)
     if _on_render_pre in bpy.app.handlers.render_pre:
         bpy.app.handlers.render_pre.remove(_on_render_pre)
 

@@ -15,7 +15,11 @@ Blender add-on that displays a stable eye-level (horizon) guide inside the camer
 
 ### 動作要件
 
-- Blender 4.0 以上
+- Blender 4.2 以上（Blender 5.2 LTS 対応）
+
+Blender 4.x の従来コンポジター API と Blender 5.x の新しいコンポジター
+ノードグループ API の両方に対応しています。5.2 対応によって 4.2 の対応が
+失われることはありません。
 
 ### インストール方法
 
@@ -56,7 +60,10 @@ Blender add-on that displays a stable eye-level (horizon) guide inside the camer
 
 ### Requirements
 
-- Blender 4.0+
+- Blender 4.2+ (including Blender 5.2 LTS)
+
+The add-on supports both the legacy Blender 4.x compositor API and the new
+Blender 5.x compositor node-group API. Blender 4.2 compatibility is retained.
 
 ### Installation
 
