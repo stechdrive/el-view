@@ -41,7 +41,6 @@ def make_camera(scene):
 
 def make_existing_compositor(scene):
     """Create a minimal user-owned compositor and return its final sockets."""
-    scene.use_nodes = True
     if hasattr(scene, "compositing_node_group"):
         tree = bpy.data.node_groups.new("EL View Existing Test", "CompositorNodeTree")
         scene.compositing_node_group = tree
@@ -50,6 +49,7 @@ def make_existing_compositor(scene):
         )
         output = tree.nodes.new("NodeGroupOutput")
     else:
+        scene.use_nodes = True
         tree = scene.node_tree
         tree.nodes.clear()
         output = tree.nodes.new("CompositorNodeComposite")
@@ -65,9 +65,7 @@ def clear_compositor(scene, tree):
         bpy.data.node_groups.remove(tree)
     else:
         tree.nodes.clear()
-    # Blender 5.x decides whether compositing is enabled before render_init;
-    # keep its default enabled state while testing late graph preparation.
-    scene.use_nodes = hasattr(scene, "compositing_node_group")
+        scene.use_nodes = False
 
 
 def assert_red_center_line(image_path):
@@ -138,6 +136,7 @@ def assert_image_transparent(image):
 
 def main():
     addon = load_addon()
+    registered = False
     depsgraph_handlers_before = tuple(bpy.app.handlers.depsgraph_update_post)
     frame_handlers_before = tuple(bpy.app.handlers.frame_change_post)
     # Blender extensions are imported and registered with bpy.data/context
@@ -145,6 +144,7 @@ def main():
     # depend on the currently loaded blend file.
     with RestrictBlend():
         addon.register()
+    registered = True
     try:
         # Camera/frame changes must never invoke compositor mutations.
         assert tuple(bpy.app.handlers.depsgraph_update_post) == depsgraph_handlers_before
@@ -188,12 +188,14 @@ def main():
         # A scene without compositor nodes must render the guide and return to
         # a working runtime compositor before rendering.
         clear_compositor(scene, tree)
+        scene.render.use_compositing = False
         settings.enable = True
         assert addon._get_compositor_cleanup(scene) is not None, (
             settings.enable,
             settings.render_overlay,
             addon._calc_eye_level_ndc_line_for_render(scene),
         )
+        assert scene.render.use_compositing
         output_path = Path(tempfile.gettempdir()) / (
             f"el_view_smoke_{bpy.app.version[0]}_{bpy.app.version[1]}.png"
         )
@@ -284,11 +286,67 @@ def main():
         # Disabling EL View restores the scene state and removes runtime data.
         settings.enable = False
         assert addon._get_compositor_cleanup(scene) is None
-        assert scene.use_nodes == hasattr(scene, "compositing_node_group")
+        assert not scene.render.use_compositing
         if hasattr(scene, "compositing_node_group"):
             assert scene.compositing_node_group is None
         else:
+            assert not scene.use_nodes
             assert len(scene.node_tree.nodes) == 0
+
+        # Runtime compositor nodes must stay out of saved blend files. Blender
+        # restores the in-memory graph after saving without marking the file
+        # dirty, while the saved scene retains the user's original switches.
+        settings.enable = True
+        runtime_info = addon._get_compositor_cleanup(scene)
+        assert runtime_info is not None
+        save_path = Path(tempfile.gettempdir()) / (
+            f"el_view_saved_state_{bpy.app.version[0]}_"
+            f"{bpy.app.version[1]}.blend"
+        )
+        bpy.ops.wm.save_as_mainfile(filepath=str(save_path), copy=True)
+        if bpy.app.version >= (5, 0, 0):
+            assert not bpy.data.is_dirty
+        runtime_info = addon._get_compositor_cleanup(scene)
+        assert runtime_info is not None
+        assert scene.render.use_compositing
+
+        with bpy.data.libraries.load(str(save_path), link=False) as (
+                data_from, data_to):
+            data_to.scenes = [data_from.scenes[0]]
+        saved_scene = data_to.scenes[0]
+        try:
+            assert not saved_scene.render.use_compositing
+            assert not bool(saved_scene.get(
+                addon._USE_COMPOSITING_WAS_OFF_PROP, False
+            ))
+            if hasattr(saved_scene, "compositing_node_group"):
+                assert saved_scene.compositing_node_group is None
+            else:
+                assert not saved_scene.use_nodes
+                if saved_scene.node_tree is not None:
+                    assert len(saved_scene.node_tree.nodes) == 0
+        finally:
+            bpy.data.scenes.remove(saved_scene)
+
+        # Extension disable is also restricted. It must restore known runtime
+        # data without scanning bpy.data.
+        runtime_tree = runtime_info["tree"]
+        runtime_image = runtime_info["overlay_img"]
+        with RestrictBlend():
+            addon.unregister()
+        registered = False
+        assert addon._comp_cleanups == {}
+        assert not scene.render.use_compositing
+        assert not any(
+            node.label in {"EL View Mix", "EL View Overlay"}
+            for node in runtime_tree.nodes
+        )
+        if hasattr(scene, "compositing_node_group"):
+            assert len(runtime_tree.nodes) == 0
+            assert runtime_tree.users == 0
+        else:
+            assert not scene.use_nodes
+        assert runtime_image.users == 0
 
         print(
             "EL_VIEW_SMOKE_OK",
@@ -296,7 +354,8 @@ def main():
             "new_compositor_api=" + str(hasattr(scene, "compositing_node_group")),
         )
     finally:
-        addon.unregister()
+        if registered:
+            addon.unregister()
 
 
 if __name__ == "__main__":

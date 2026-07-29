@@ -25,7 +25,7 @@ Blender 4.x の従来コンポジター API と Blender 5.x の新しいコン�
 
 ### インストール方法
 
-1. Releases から `el_view.zip` を [Download](https://github.com/stechdrive/el-view/releases)
+1. [Releases](https://github.com/stechdrive/el-view/releases) またはリポジトリ直下から [`el_view.zip`](./el_view.zip) をダウンロード
 2. Blender → `Edit` → `Preferences` → `Add-ons`
 3. 右上の `↓` ドロップダウン → `Install from Disk...`
 4. ダウンロードした `el_view.zip` を選択
@@ -71,7 +71,7 @@ Blender 5.x compositor node-group API. Blender 4.2 compatibility is retained.
 
 ### Installation
 
-1. [Download](https://github.com/stechdrive/el-view/releases) `el_view.zip` from Releases
+1. Download [`el_view.zip`](./el_view.zip) from the repository or [Releases](https://github.com/stechdrive/el-view/releases)
 2. Blender → `Edit` → `Preferences` → `Add-ons`
 3. Click `↓` dropdown → `Install from Disk...`
 4. Select `el_view.zip`

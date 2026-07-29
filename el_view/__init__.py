@@ -27,7 +27,7 @@
 bl_info = {
     "name": "EL View",
     "author": "stechdrive",
-    "version": (2, 1, 2),
+    "version": (2, 1, 3),
     "blender": (4, 2, 0),
     "location": "3D View > N Panel > View > EL View",
     "description": "Display eye level (horizon) line on camera view and render output",
@@ -333,6 +333,7 @@ _RUNTIME_TREE_PROP: str = "_elview_runtime_tree"
 _RUNTIME_NODE_PROP: str = "_elview_runtime_created"
 _RUNTIME_INTERFACE_PROP: str = "_elview_runtime_interface_socket"
 _USE_NODES_WAS_OFF_PROP: str = "_elview_use_nodes_was_off"
+_USE_COMPOSITING_WAS_OFF_PROP: str = "_elview_use_compositing_was_off"
 
 # Runtime state used to restore each scene's compositor when EL View is
 # disabled or the add-on is unloaded.
@@ -351,13 +352,26 @@ def _overlay_image_name(scene: bpy.types.Scene) -> str:
     return f"{_OVERLAY_IMG_NAME}_{_scene_key(scene):x}"
 
 
+def _remove_datablock(collection_name: str, datablock) -> None:
+    """Remove a temporary data-block when Blender data access is available.
+
+    Extension unregistration runs with ``bpy.data`` restricted. Direct scene
+    and node references can still be restored safely in that context; any
+    unlinked temporary data-blocks are then left for Blender's orphan cleanup.
+    """
+    collection = getattr(bpy.data, collection_name, None)
+    if collection is None or datablock is None:
+        return
+    try:
+        collection.remove(datablock)
+    except Exception:
+        pass
+
+
 def _remove_runtime_images(images) -> None:
     for image in images:
         if image is not None and image.name.startswith(_OVERLAY_IMG_NAME):
-            try:
-                bpy.data.images.remove(image)
-            except Exception:
-                pass
+            _remove_datablock("images", image)
 
 
 def _remove_saved_runtime_nodes(tree: bpy.types.NodeTree) -> None:
@@ -425,8 +439,26 @@ def _remove_saved_runtime_nodes(tree: bpy.types.NodeTree) -> None:
     _remove_runtime_images(images)
 
 
+def _restore_saved_compositor_state(scene: bpy.types.Scene) -> None:
+    """Restore compositor switches recorded by a previous runtime graph."""
+    if bool(scene.get(_USE_COMPOSITING_WAS_OFF_PROP, False)):
+        scene.render.use_compositing = False
+    try:
+        del scene[_USE_COMPOSITING_WAS_OFF_PROP]
+    except Exception:
+        pass
+
+    if (not hasattr(scene, "compositing_node_group") and
+            bool(scene.get(_USE_NODES_WAS_OFF_PROP, False))):
+        scene.use_nodes = False
+    try:
+        del scene[_USE_NODES_WAS_OFF_PROP]
+    except Exception:
+        pass
+
+
 def _remove_saved_runtime(scene: bpy.types.Scene,
-                          restore_use_nodes: bool = False) -> None:
+                          restore_scene_state: bool = False) -> None:
     """Clean runtime data that survived in a saved blend file."""
     if hasattr(scene, "compositing_node_group"):
         tree = scene.compositing_node_group
@@ -436,10 +468,7 @@ def _remove_saved_runtime(scene: bpy.types.Scene,
                 if node.type == 'IMAGE' and getattr(node, "image", None) is not None
             ]
             scene.compositing_node_group = None
-            try:
-                bpy.data.node_groups.remove(tree)
-            except Exception:
-                pass
+            _remove_datablock("node_groups", tree)
             _remove_runtime_images(images)
         elif tree is not None:
             _remove_saved_runtime_nodes(tree)
@@ -448,16 +477,12 @@ def _remove_saved_runtime(scene: bpy.types.Scene,
         if tree is not None:
             _remove_saved_runtime_nodes(tree)
 
-    if restore_use_nodes and bool(scene.get(_USE_NODES_WAS_OFF_PROP, False)):
-        if hasattr(scene, "use_nodes"):
-            scene.use_nodes = False
-        try:
-            del scene[_USE_NODES_WAS_OFF_PROP]
-        except Exception:
-            pass
+    if restore_scene_state:
+        _restore_saved_compositor_state(scene)
 
 
-def _ensure_compositor_tree(scene: bpy.types.Scene) -> Tuple[Optional[bpy.types.NodeTree], bool, bool]:
+def _ensure_compositor_tree(scene: bpy.types.Scene) -> Tuple[
+        Optional[bpy.types.NodeTree], bool, bool, bool]:
     """Return the scene compositor tree and how it must be restored.
 
     Blender 4.x owns the compositor tree directly on ``Scene.node_tree``.
@@ -465,13 +490,13 @@ def _ensure_compositor_tree(scene: bpy.types.Scene) -> Tuple[Optional[bpy.types.
     ``Scene.compositing_node_group`` data-block.  Feature detection keeps the
     same add-on package compatible with both APIs.
     """
-    use_nodes_was = bool(getattr(scene, "use_nodes", False))
-    if bool(scene.get(_USE_NODES_WAS_OFF_PROP, False)):
-        use_nodes_was = False
-    if hasattr(scene, "use_nodes") and not bool(scene.use_nodes):
-        scene.use_nodes = True
-    if not use_nodes_was:
-        scene[_USE_NODES_WAS_OFF_PROP] = True
+    use_compositing_was = bool(scene.render.use_compositing)
+    if bool(scene.get(_USE_COMPOSITING_WAS_OFF_PROP, False)):
+        use_compositing_was = False
+    if not scene.render.use_compositing:
+        scene.render.use_compositing = True
+    if not use_compositing_was:
+        scene[_USE_COMPOSITING_WAS_OFF_PROP] = True
 
     if hasattr(scene, "compositing_node_group"):
         tree = scene.compositing_node_group
@@ -482,9 +507,17 @@ def _ensure_compositor_tree(scene: bpy.types.Scene) -> Tuple[Optional[bpy.types.
             )
             tree[_RUNTIME_TREE_PROP] = True
             scene.compositing_node_group = tree
-        return tree, use_nodes_was, created_tree
+        return tree, True, use_compositing_was, created_tree
 
-    return getattr(scene, "node_tree", None), use_nodes_was, False
+    use_nodes_was = bool(scene.use_nodes)
+    if bool(scene.get(_USE_NODES_WAS_OFF_PROP, False)):
+        use_nodes_was = False
+    if not scene.use_nodes:
+        scene.use_nodes = True
+    if not use_nodes_was:
+        scene[_USE_NODES_WAS_OFF_PROP] = True
+
+    return scene.node_tree, use_nodes_was, use_compositing_was, False
 
 
 def _ensure_compositor_output(tree: bpy.types.NodeTree,
@@ -658,14 +691,11 @@ def _inject_compositor_nodes(scene: bpy.types.Scene,
     if existing is not None:
         _teardown_compositor(scene)
 
-    tree, use_nodes_was, created_tree = _ensure_compositor_tree(scene)
+    tree, use_nodes_was, use_compositing_was, created_tree = (
+        _ensure_compositor_tree(scene)
+    )
     if tree is None:
-        if not use_nodes_was and hasattr(scene, "use_nodes"):
-            scene.use_nodes = False
-            try:
-                del scene[_USE_NODES_WAS_OFF_PROP]
-            except Exception:
-                pass
+        _restore_saved_compositor_state(scene)
         return False
 
     use_group_output = hasattr(scene, "compositing_node_group")
@@ -673,6 +703,7 @@ def _inject_compositor_nodes(scene: bpy.types.Scene,
         'scene': scene,
         'tree': tree,
         'use_nodes_was': use_nodes_was,
+        'use_compositing_was': use_compositing_was,
         'created_tree': created_tree,
         'created_output_node': False,
         'created_interface_socket': None,
@@ -767,9 +798,13 @@ def _teardown_compositor(scene: bpy.types.Scene) -> None:
         try:
             if owner_scene.compositing_node_group == tree:
                 owner_scene.compositing_node_group = None
-            bpy.data.node_groups.remove(tree)
         except Exception:
             pass
+        try:
+            tree.nodes.clear()
+        except Exception:
+            pass
+        _remove_datablock("node_groups", tree)
     else:
         # Removing the two temporary nodes also removes their temporary links.
         for key in ('alpha_node', 'img_node'):
@@ -804,21 +839,24 @@ def _teardown_compositor(scene: bpy.types.Scene) -> None:
             except Exception:
                 pass
 
-    # Restore the scene's compositor-enable state on both APIs.
-    if not info['use_nodes_was'] and hasattr(owner_scene, "use_nodes"):
+    # Restore compositor switches without touching Blender 5.x's deprecated
+    # Scene.use_nodes compatibility property.
+    if not info['use_compositing_was']:
+        owner_scene.render.use_compositing = False
+    if (not hasattr(owner_scene, "compositing_node_group") and
+            not info['use_nodes_was']):
         owner_scene.use_nodes = False
+    for property_name in (
+            _USE_COMPOSITING_WAS_OFF_PROP,
+            _USE_NODES_WAS_OFF_PROP):
         try:
-            del owner_scene[_USE_NODES_WAS_OFF_PROP]
+            del owner_scene[property_name]
         except Exception:
             pass
 
     # Remove temp image
     img = info.get('overlay_img')
-    if img is not None:
-        try:
-            bpy.data.images.remove(img)
-        except Exception:
-            pass
+    _remove_datablock("images", img)
 
 
 # ---- stable compositor lifecycle / render handlers ----
@@ -851,7 +889,7 @@ def _apply_scene_overlay_settings(scene: bpy.types.Scene) -> None:
         if _get_compositor_cleanup(scene) is not None:
             _teardown_compositor(scene)
         else:
-            _remove_saved_runtime(scene, restore_use_nodes=True)
+            _remove_saved_runtime(scene, restore_scene_state=True)
         return
 
     _ensure_render_overlay(scene)
@@ -927,6 +965,21 @@ def _discard_runtime_state(*_args) -> None:
     _comp_cleanups.clear()
 
 
+def _teardown_known_runtime_state() -> None:
+    """Restore every compositor tracked by this Python module."""
+    for info in list(_comp_cleanups.values()):
+        _teardown_compositor(info['scene'])
+    _comp_cleanups.clear()
+
+
+@persistent
+def _suspend_runtime_state_for_save(*_args) -> None:
+    """Keep temporary compositor data out of saved blend files."""
+    _teardown_known_runtime_state()
+    for scene in bpy.data.scenes:
+        _remove_saved_runtime(scene, restore_scene_state=True)
+
+
 @persistent
 def _restore_runtime_state(*_args) -> None:
     """Reconcile saved runtime nodes after load/undo/redo."""
@@ -993,6 +1046,8 @@ def register() -> None:
     bpy.app.handlers.load_post.append(_restore_runtime_state)
     bpy.app.handlers.undo_post.append(_restore_runtime_state)
     bpy.app.handlers.redo_post.append(_restore_runtime_state)
+    bpy.app.handlers.save_pre.append(_suspend_runtime_state_for_save)
+    bpy.app.handlers.save_post.append(_restore_runtime_state)
 
     # Blender restricts bpy.data and bpy.context while an extension is being
     # registered. Files loaded afterward are reconciled by the lifecycle
@@ -1003,6 +1058,10 @@ def unregister() -> None:
     """Unregister the addon classes, properties, and handlers."""
     global _draw_handle
 
+    if _restore_runtime_state in bpy.app.handlers.save_post:
+        bpy.app.handlers.save_post.remove(_restore_runtime_state)
+    if _suspend_runtime_state_for_save in bpy.app.handlers.save_pre:
+        bpy.app.handlers.save_pre.remove(_suspend_runtime_state_for_save)
     if _restore_runtime_state in bpy.app.handlers.redo_post:
         bpy.app.handlers.redo_post.remove(_restore_runtime_state)
     if _restore_runtime_state in bpy.app.handlers.undo_post:
@@ -1020,10 +1079,10 @@ def unregister() -> None:
     if _on_render_pre in bpy.app.handlers.render_pre:
         bpy.app.handlers.render_pre.remove(_on_render_pre)
 
-    for info in list(_comp_cleanups.values()):
-        _teardown_compositor(info['scene'])
-    for scene in bpy.data.scenes:
-        _remove_saved_runtime(scene, restore_use_nodes=True)
+    # Blender extensions are unregistered with bpy.data restricted. Restore
+    # only the scenes already held by this module; saved-file reconciliation
+    # is handled by load/save lifecycle callbacks while the add-on is active.
+    _teardown_known_runtime_state()
 
     if _draw_handle is not None:
         bpy.types.SpaceView3D.draw_handler_remove(_draw_handle, 'WINDOW')

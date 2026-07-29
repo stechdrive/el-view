@@ -17,3 +17,4 @@ Thumbs.db
 
 # Distribution
 *.zip
+!el_view.zip
