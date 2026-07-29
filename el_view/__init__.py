@@ -833,8 +833,9 @@ def register() -> None:
     bpy.app.handlers.depsgraph_update_post.append(_on_depsgraph_update_post)
     bpy.app.handlers.load_post.append(_on_load_post)
 
-    for scene in bpy.data.scenes:
-        _sync_scene_overlay(scene)
+    # Blender restricts bpy.data and bpy.context while an extension is being
+    # registered. Files loaded afterward are synchronised by _on_load_post,
+    # while scene changes use the property/depsgraph handlers.
 
 
 def unregister() -> None:

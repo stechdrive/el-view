@@ -1,4 +1,4 @@
-"""Headless smoke test for Blender's legacy and current compositor APIs.
+"""Headless smoke test for add-on registration and Blender compositor APIs.
 
 Run with, for example:
     blender --background --factory-startup --python tests/blender_smoke_test.py
@@ -10,6 +10,11 @@ from pathlib import Path
 import tempfile
 
 import bpy
+
+try:
+    from _bpy_restrict_state import RestrictBlend
+except ImportError:
+    from bpy_restrict_state import RestrictBlend
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -85,7 +90,11 @@ def assert_red_center_line(image_path):
 
 def main():
     addon = load_addon()
-    addon.register()
+    # Blender extensions are imported and registered with bpy.data/context
+    # restricted. Keep this path covered so registration cannot accidentally
+    # depend on the currently loaded blend file.
+    with RestrictBlend():
+        addon.register()
     try:
         scene = bpy.context.scene
         make_camera(scene)
