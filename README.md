@@ -13,6 +13,7 @@ Blender add-on that displays a stable eye-level (horizon) guide inside the camer
 - Eevee / Cycles / Workbench すべてのレンダリングエンジンに対応
 - カメラがどの方向を向いていても安定して表示
 - カメラのロール（ダッチアングル）に合わせてワールド水平線が傾斜
+- カメラ操作中はコンポジターを変更せず、安定したリアルタイム編集
 
 ### 動作要件
 
@@ -59,6 +60,7 @@ Blender 4.x の従来コンポジター API と Blender 5.x の新しいコン�
 - Works with Eevee, Cycles, and Workbench
 - Stable display regardless of camera orientation
 - World horizon follows camera roll (Dutch angles)
+- Stable camera editing without compositor mutations during transforms
 
 ### Requirements
 

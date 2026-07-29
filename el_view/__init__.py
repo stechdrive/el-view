@@ -27,7 +27,7 @@
 bl_info = {
     "name": "EL View",
     "author": "stechdrive",
-    "version": (2, 1, 1),
+    "version": (2, 1, 2),
     "blender": (4, 2, 0),
     "location": "3D View > N Panel > View > EL View",
     "description": "Display eye level (horizon) line on camera view and render output",
@@ -52,10 +52,10 @@ Line2D = Tuple[Tuple[float, float], Tuple[float, float]]
 
 def _settings_update(_self, context) -> None:
     """Keep the render compositor ready when an EL View setting changes."""
-    sync = globals().get("_sync_scene_overlay")
+    apply_settings = globals().get("_apply_scene_overlay_settings")
     scene = getattr(context, "scene", None) if context is not None else None
-    if sync is not None and scene is not None:
-        sync(scene)
+    if apply_settings is not None and scene is not None:
+        apply_settings(scene)
 
 
 class ELViewSettings(PropertyGroup):
@@ -581,8 +581,14 @@ def _rasterize_line_pixels(
 
 
 def _create_overlay_image(
-        scene: bpy.types.Scene, ndc_line: Line2D) -> Optional[bpy.types.Image]:
-    """Create (or update) a transparent image with the eye-level line."""
+        scene: bpy.types.Scene,
+        ndc_line: Optional[Line2D]) -> Optional[bpy.types.Image]:
+    """Create or update the stable render-overlay image.
+
+    ``None`` (or a line outside the frame) clears the image to transparent
+    instead of removing it.  Keeping the same image data-block attached to the
+    compositor avoids graph churn while the camera moves.
+    """
     settings = scene.elview_settings
     render = scene.render
     scale: float = render.resolution_percentage / 100.0
@@ -591,22 +597,22 @@ def _create_overlay_image(
     if img_w <= 0 or img_h <= 0:
         return None
 
-    line_w: int = max(1, int(settings.line_width))
-    pixel_line: Line2D = (
-        (
-            (ndc_line[0][0] + 1.0) * 0.5 * (img_w - 1),
-            (ndc_line[0][1] + 1.0) * 0.5 * (img_h - 1),
-        ),
-        (
-            (ndc_line[1][0] + 1.0) * 0.5 * (img_w - 1),
-            (ndc_line[1][1] + 1.0) * 0.5 * (img_h - 1),
-        ),
-    )
-    line_pixels = _rasterize_line_pixels(
-        pixel_line, img_w, img_h, line_w
-    )
-    if not line_pixels:
-        return None
+    line_pixels: list[Tuple[int, int]] = []
+    if ndc_line is not None:
+        line_w: int = max(1, int(settings.line_width))
+        pixel_line: Line2D = (
+            (
+                (ndc_line[0][0] + 1.0) * 0.5 * (img_w - 1),
+                (ndc_line[0][1] + 1.0) * 0.5 * (img_h - 1),
+            ),
+            (
+                (ndc_line[1][0] + 1.0) * 0.5 * (img_w - 1),
+                (ndc_line[1][1] + 1.0) * 0.5 * (img_h - 1),
+            ),
+        )
+        line_pixels = _rasterize_line_pixels(
+            pixel_line, img_w, img_h, line_w
+        )
 
     r, g, b, a = settings.color[0], settings.color[1], settings.color[2], settings.color[3]
 
@@ -614,8 +620,7 @@ def _create_overlay_image(
     img_name = _overlay_image_name(scene)
     img = bpy.data.images.get(img_name)
     if img is not None and (img.size[0] != img_w or img.size[1] != img_h):
-        bpy.data.images.remove(img)
-        img = None
+        img.scale(img_w, img_h)
     if img is None:
         img = bpy.data.images.new(img_name, img_w, img_h,
                                   alpha=True, float_buffer=True)
@@ -625,8 +630,9 @@ def _create_overlay_image(
     try:
         import numpy as np
         px = np.zeros((img_h, img_w, 4), dtype=np.float32)
-        coordinates = np.asarray(line_pixels, dtype=np.intp)
-        px[coordinates[:, 1], coordinates[:, 0]] = [r, g, b, a]
+        if line_pixels:
+            coordinates = np.asarray(line_pixels, dtype=np.intp)
+            px[coordinates[:, 1], coordinates[:, 0]] = [r, g, b, a]
         img.pixels.foreach_set(px.ravel())
     except Exception:
         px = [0.0] * (img_w * img_h * 4)
@@ -815,15 +821,31 @@ def _teardown_compositor(scene: bpy.types.Scene) -> None:
             pass
 
 
-# ---- compositor synchronisation / render handlers ----
+# ---- stable compositor lifecycle / render handlers ----
 
-def _sync_scene_overlay(scene: bpy.types.Scene) -> None:
-    """Prepare or update the persistent runtime compositor for *scene*.
+def _ensure_render_overlay(scene: bpy.types.Scene) -> Optional[dict]:
+    """Create the stable compositor graph once and return its runtime state."""
+    info = _get_compositor_cleanup(scene)
+    if info is not None:
+        return info
 
-    Blender 5.x compiles its compositor graph before ``render_init`` and
-    ``render_pre`` run.  The graph therefore has to be ready while the scene is
-    edited; the render handlers remain as a final per-frame value refresh.
-    """
+    # A blend file can contain runtime nodes saved by an earlier session while
+    # the direct RNA references in _comp_cleanups no longer exist.
+    _remove_saved_runtime(scene)
+    overlay = _create_overlay_image(scene, None)
+    if overlay is None:
+        return None
+    if not _inject_compositor_nodes(scene, overlay):
+        try:
+            bpy.data.images.remove(overlay)
+        except Exception:
+            pass
+        return None
+    return _get_compositor_cleanup(scene)
+
+
+def _apply_scene_overlay_settings(scene: bpy.types.Scene) -> None:
+    """Create or remove the graph only when the user changes its enabled state."""
     settings = getattr(scene, "elview_settings", None)
     if settings is None or not settings.enable or not settings.render_overlay:
         if _get_compositor_cleanup(scene) is not None:
@@ -832,82 +854,84 @@ def _sync_scene_overlay(scene: bpy.types.Scene) -> None:
             _remove_saved_runtime(scene, restore_use_nodes=True)
         return
 
-    ndc_line = _calc_eye_level_ndc_line_for_render(scene)
-    if ndc_line is None:
-        if _get_compositor_cleanup(scene) is not None:
-            _teardown_compositor(scene)
-        else:
-            _remove_saved_runtime(scene, restore_use_nodes=True)
-        return
+    _ensure_render_overlay(scene)
 
+
+def _render_overlay_signature(
+        scene: bpy.types.Scene,
+        ndc_line: Optional[Line2D]) -> tuple:
+    """Return the image content signature for one rendered frame."""
+    settings = scene.elview_settings
     render = scene.render
-    signature = (
+    line_signature = (
+        None if ndc_line is None else
         tuple(
             round(coordinate, 9)
             for point in ndc_line
             for coordinate in point
-        ),
+        )
+    )
+    return (
+        line_signature,
         render.resolution_x,
         render.resolution_y,
         render.resolution_percentage,
         round(settings.line_width, 4),
         tuple(round(value, 6) for value in settings.color),
     )
-    info = _get_compositor_cleanup(scene)
-    if info is not None and info.get('signature') == signature:
+
+
+def _update_render_overlay_for_render(scene: bpy.types.Scene) -> None:
+    """Refresh pixels for a render without rebuilding its compositor graph."""
+    settings = getattr(scene, "elview_settings", None)
+    if settings is None or not settings.enable or not settings.render_overlay:
+        _apply_scene_overlay_settings(scene)
         return
+
+    info = _ensure_render_overlay(scene)
     if info is None:
-        _remove_saved_runtime(scene)
+        return
+
+    ndc_line = _calc_eye_level_ndc_line_for_render(scene)
+    signature = _render_overlay_signature(scene, ndc_line)
+    if info.get('signature') == signature:
+        return
 
     overlay = _create_overlay_image(scene, ndc_line)
     if overlay is None:
-        _teardown_compositor(scene)
         return
 
-    if info is None:
-        if not _inject_compositor_nodes(scene, overlay):
-            try:
-                bpy.data.images.remove(overlay)
-            except Exception:
-                pass
-            return
-        info = _get_compositor_cleanup(scene)
-    else:
+    if overlay != info.get('overlay_img'):
         node = info.get('img_node')
-        if node is not None:
+        if node is not None and node.image != overlay:
             node.image = overlay
         info['overlay_img'] = overlay
-
-    if info is not None:
-        info['signature'] = signature
+    info['signature'] = signature
 
 
 @persistent
 def _on_render_init(scene, *_args) -> None:
-    """Refresh the graph before rendering (fallback for scripted workflows)."""
-    _sync_scene_overlay(scene)
+    """Refresh render pixels; the graph was prepared when settings changed."""
+    _update_render_overlay_for_render(scene)
 
 
 @persistent
 def _on_render_pre(scene, *_args) -> None:
     """Refresh the overlay for the evaluated animation frame."""
-    _sync_scene_overlay(scene)
+    _update_render_overlay_for_render(scene)
 
 
 @persistent
-def _on_frame_change_post(scene, *_args) -> None:
-    _sync_scene_overlay(scene)
+def _discard_runtime_state(*_args) -> None:
+    """Drop RNA references before Blender invalidates data on load/undo/redo."""
+    _comp_cleanups.clear()
 
 
 @persistent
-def _on_depsgraph_update_post(scene, *_args) -> None:
-    _sync_scene_overlay(scene)
-
-
-@persistent
-def _on_load_post(_unused) -> None:
+def _restore_runtime_state(*_args) -> None:
+    """Reconcile saved runtime nodes after load/undo/redo."""
     for scene in bpy.data.scenes:
-        _sync_scene_overlay(scene)
+        _apply_scene_overlay_settings(scene)
 
 
 # ---------------------------------------------------------------------------
@@ -963,34 +987,43 @@ def register() -> None:
 
     bpy.app.handlers.render_pre.append(_on_render_pre)
     bpy.app.handlers.render_init.append(_on_render_init)
-    bpy.app.handlers.frame_change_post.append(_on_frame_change_post)
-    bpy.app.handlers.depsgraph_update_post.append(_on_depsgraph_update_post)
-    bpy.app.handlers.load_post.append(_on_load_post)
+    bpy.app.handlers.load_pre.append(_discard_runtime_state)
+    bpy.app.handlers.undo_pre.append(_discard_runtime_state)
+    bpy.app.handlers.redo_pre.append(_discard_runtime_state)
+    bpy.app.handlers.load_post.append(_restore_runtime_state)
+    bpy.app.handlers.undo_post.append(_restore_runtime_state)
+    bpy.app.handlers.redo_post.append(_restore_runtime_state)
 
     # Blender restricts bpy.data and bpy.context while an extension is being
-    # registered. Files loaded afterward are synchronised by _on_load_post,
-    # while scene changes use the property/depsgraph handlers.
+    # registered. Files loaded afterward are reconciled by the lifecycle
+    # handlers, while the property callback prepares newly enabled scenes.
 
 
 def unregister() -> None:
     """Unregister the addon classes, properties, and handlers."""
     global _draw_handle
 
-    for info in list(_comp_cleanups.values()):
-        _teardown_compositor(info['scene'])
-    for scene in bpy.data.scenes:
-        _remove_saved_runtime(scene, restore_use_nodes=True)
-
-    if _on_load_post in bpy.app.handlers.load_post:
-        bpy.app.handlers.load_post.remove(_on_load_post)
-    if _on_depsgraph_update_post in bpy.app.handlers.depsgraph_update_post:
-        bpy.app.handlers.depsgraph_update_post.remove(_on_depsgraph_update_post)
-    if _on_frame_change_post in bpy.app.handlers.frame_change_post:
-        bpy.app.handlers.frame_change_post.remove(_on_frame_change_post)
+    if _restore_runtime_state in bpy.app.handlers.redo_post:
+        bpy.app.handlers.redo_post.remove(_restore_runtime_state)
+    if _restore_runtime_state in bpy.app.handlers.undo_post:
+        bpy.app.handlers.undo_post.remove(_restore_runtime_state)
+    if _restore_runtime_state in bpy.app.handlers.load_post:
+        bpy.app.handlers.load_post.remove(_restore_runtime_state)
+    if _discard_runtime_state in bpy.app.handlers.redo_pre:
+        bpy.app.handlers.redo_pre.remove(_discard_runtime_state)
+    if _discard_runtime_state in bpy.app.handlers.undo_pre:
+        bpy.app.handlers.undo_pre.remove(_discard_runtime_state)
+    if _discard_runtime_state in bpy.app.handlers.load_pre:
+        bpy.app.handlers.load_pre.remove(_discard_runtime_state)
     if _on_render_init in bpy.app.handlers.render_init:
         bpy.app.handlers.render_init.remove(_on_render_init)
     if _on_render_pre in bpy.app.handlers.render_pre:
         bpy.app.handlers.render_pre.remove(_on_render_pre)
+
+    for info in list(_comp_cleanups.values()):
+        _teardown_compositor(info['scene'])
+    for scene in bpy.data.scenes:
+        _remove_saved_runtime(scene, restore_use_nodes=True)
 
     if _draw_handle is not None:
         bpy.types.SpaceView3D.draw_handler_remove(_draw_handle, 'WINDOW')
