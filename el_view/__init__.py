@@ -27,7 +27,7 @@
 bl_info = {
     "name": "EL View",
     "author": "stechdrive",
-    "version": (2, 1, 0),
+    "version": (2, 1, 1),
     "blender": (4, 2, 0),
     "location": "3D View > N Panel > View > EL View",
     "description": "Display eye level (horizon) line on camera view and render output",
@@ -41,8 +41,10 @@ from gpu_extras.batch import batch_for_shader
 from bpy.app.handlers import persistent
 from bpy.types import PropertyGroup, Panel
 from bpy.props import BoolProperty, FloatProperty, FloatVectorProperty, PointerProperty
-from mathutils import Vector, Matrix
+from mathutils import Vector
 from typing import Optional, Tuple
+
+Line2D = Tuple[Tuple[float, float], Tuple[float, float]]
 
 # ---------------------------------------------------------------------------
 # Property Group
@@ -95,8 +97,9 @@ class ELViewSettings(PropertyGroup):
 # Core calculation
 # ---------------------------------------------------------------------------
 
-def _get_eye_level_sample(cam_obj: bpy.types.Object) -> Optional[Vector]:
-    """Return a world-space point on the eye-level plane directly ahead of *cam_obj*.
+def _get_eye_level_samples(
+        cam_obj: bpy.types.Object) -> Optional[Tuple[Vector, Vector]]:
+    """Return two world-space points spanning the eye-level plane.
 
     Returns ``None`` when the camera points straight up or down
     (eye level is undefined in that orientation).
@@ -112,27 +115,87 @@ def _get_eye_level_sample(cam_obj: bpy.types.Object) -> Optional[Vector]:
         return None
     forward_xy.normalize()
 
-    sample: Vector = cam_pos + forward_xy * 100.0
-    sample.z = cam_pos.z  # eye level = camera world Z
-    return sample
+    center: Vector = cam_pos + forward_xy * 100.0
+    center.z = cam_pos.z  # eye level = camera world Z
+    horizontal = Vector((-forward_xy.y, forward_xy.x, 0.0)) * 100.0
+    return center - horizontal, center + horizontal
 
 
-def _calc_eye_level_ndc_y_for_render(scene: bpy.types.Scene) -> Optional[float]:
-    """Calculate the NDC Y of the eye level line for render output.
+def _clip_infinite_line_to_rect(
+        line: Line2D, max_x: float, max_y: float) -> Optional[Line2D]:
+    """Clip an infinite 2D line to a rectangle from (0, 0) to (max_x, max_y)."""
+    if max_x < 0.0 or max_y < 0.0:
+        return None
+
+    (x0, y0), (x1, y1) = line
+    dx = x1 - x0
+    dy = y1 - y0
+    if (dx * dx) + (dy * dy) < 1e-12:
+        return None
+
+    epsilon = 1e-6
+    candidates: list[Tuple[float, float]] = []
+
+    def add_candidate(x: float, y: float) -> None:
+        if (-epsilon <= x <= max_x + epsilon and
+                -epsilon <= y <= max_y + epsilon):
+            point = (
+                min(max(x, 0.0), max_x),
+                min(max(y, 0.0), max_y),
+            )
+            if all(
+                    (point[0] - other[0]) ** 2 +
+                    (point[1] - other[1]) ** 2 > 1e-10
+                    for other in candidates):
+                candidates.append(point)
+
+    if abs(dx) > epsilon:
+        for x in (0.0, max_x):
+            t = (x - x0) / dx
+            add_candidate(x, y0 + t * dy)
+    if abs(dy) > epsilon:
+        for y in (0.0, max_y):
+            t = (y - y0) / dy
+            add_candidate(x0 + t * dx, y)
+
+    if len(candidates) < 2:
+        return None
+
+    # A corner intersection can produce more than two candidates after
+    # floating-point clamping. Keep the pair spanning the longest segment.
+    best_line: Optional[Line2D] = None
+    best_distance = -1.0
+    for index, start in enumerate(candidates):
+        for end in candidates[index + 1:]:
+            distance = (
+                (end[0] - start[0]) ** 2 +
+                (end[1] - start[1]) ** 2
+            )
+            if distance > best_distance:
+                best_distance = distance
+                best_line = (start, end)
+    return best_line
+
+
+def _calc_eye_level_ndc_line_for_render(
+        scene: bpy.types.Scene) -> Optional[Line2D]:
+    """Calculate the NDC line of the eye level for render output.
 
     Uses ``view_frame()`` and simple perspective math to compute the
-    NDC Y without requiring a depsgraph.  This works reliably in
-    render handler contexts where ``bpy.context`` is restricted.
+    two-dimensional line without requiring a depsgraph. This works reliably
+    in render handler contexts where ``bpy.context`` is restricted.
     """
     cam_obj = scene.camera
     if cam_obj is None:
         return None
 
-    sample = _get_eye_level_sample(cam_obj)
-    if sample is None:
+    samples = _get_eye_level_samples(cam_obj)
+    if samples is None:
         return None
 
     cam_data = cam_obj.data
+    if cam_data.type not in {'PERSP', 'ORTHO'}:
+        return None
 
     # view_frame returns the 4 frustum corners in camera local space.
     # No depsgraph needed — only camera data and scene render settings.
@@ -143,34 +206,44 @@ def _calc_eye_level_ndc_y_for_render(scene: bpy.types.Scene) -> Optional[float]:
     if depth <= 0.0:
         return None
 
-    # Vertical extent of the view plane
+    # Extents of the view plane
+    xs = [co.x for co in frame]
     ys = [co.y for co in frame]
+    left_x: float = min(xs)
+    right_x: float = max(xs)
     bottom_y: float = min(ys)
     top_y: float = max(ys)
+    frame_width: float = right_x - left_x
     frame_height: float = top_y - bottom_y
-    if frame_height <= 0.0:
+    if frame_width <= 0.0 or frame_height <= 0.0:
         return None
 
-    # Transform sample point from world to camera local space
-    sample_local: Vector = cam_obj.matrix_world.inverted() @ sample
+    world_to_camera = cam_obj.matrix_world.inverted()
 
-    # Project onto the view plane
-    if cam_data.type == 'PERSP':
-        if sample_local.z >= 0.0:
-            return None  # behind camera
-        proj_y: float = sample_local.y * depth / (-sample_local.z)
-    elif cam_data.type == 'ORTHO':
-        proj_y = sample_local.y
-    else:
-        return None  # panoramic etc. — not supported
+    def project(sample: Vector) -> Optional[Tuple[float, float]]:
+        sample_local: Vector = world_to_camera @ sample
+        if cam_data.type == 'PERSP':
+            if sample_local.z >= 0.0:
+                return None
+            scale = depth / (-sample_local.z)
+            proj_x = sample_local.x * scale
+            proj_y = sample_local.y * scale
+        else:
+            proj_x = sample_local.x
+            proj_y = sample_local.y
 
-    # Normalise to NDC Y  [-1, 1]
-    ndc_y: float = (2.0 * (proj_y - bottom_y) / frame_height) - 1.0
+        return (
+            (2.0 * (proj_x - left_x) / frame_width) - 1.0,
+            (2.0 * (proj_y - bottom_y) / frame_height) - 1.0,
+        )
 
-    if ndc_y < -1.0 or ndc_y > 1.0:
+    start = project(samples[0])
+    end = project(samples[1])
+    if start is None or end is None:
         return None
-
-    return ndc_y
+    if ((end[0] - start[0]) ** 2 + (end[1] - start[1]) ** 2) < 1e-12:
+        return None
+    return start, end
 
 
 # ---------------------------------------------------------------------------
@@ -200,28 +273,35 @@ def _draw_callback() -> None:
     if cam_obj is None:
         return
 
-    sample = _get_eye_level_sample(cam_obj)
-    if sample is None:
+    samples = _get_eye_level_samples(cam_obj)
+    if samples is None:
         return
 
-    # Project the sample point directly to viewport pixel coordinates.
+    # Project two points so camera roll remains represented by the line slope.
     # location_3d_to_region_2d handles all viewport/camera/NDC mapping
     # correctly, including letterboxing and camera zoom/offset.
-    px = location_3d_to_region_2d(region, rv3d, sample)
-    if px is None:
+    projected = [
+        location_3d_to_region_2d(region, rv3d, sample)
+        for sample in samples
+    ]
+    if any(point is None for point in projected):
         return
 
-    pixel_y: float = px.y
-
-    # Clip to viewport region
-    if pixel_y < 0 or pixel_y > region.height:
+    coords = _clip_infinite_line_to_rect(
+        (
+            (projected[0].x, projected[0].y),
+            (projected[1].x, projected[1].y),
+        ),
+        float(region.width),
+        float(region.height),
+    )
+    if coords is None:
         return
 
     color = tuple(settings.color)
     width: float = settings.line_width
 
     shader = gpu.shader.from_builtin('UNIFORM_COLOR')
-    coords = [(0, pixel_y), (region.width, pixel_y)]
     batch = batch_for_shader(shader, 'LINES', {"pos": coords})
 
     gpu.state.blend_set('ALPHA')
@@ -460,7 +540,48 @@ def _ensure_compositor_output(tree: bpy.types.NodeTree,
     return output_node, output_input, created_output_node, created_interface_socket
 
 
-def _create_overlay_image(scene: bpy.types.Scene, ndc_y: float) -> Optional[bpy.types.Image]:
+def _rasterize_line_pixels(
+        line: Line2D, width: int, height: int,
+        line_width: int) -> list[Tuple[int, int]]:
+    """Return image pixels covered by an infinite line."""
+    if width <= 0 or height <= 0:
+        return []
+
+    clipped = _clip_infinite_line_to_rect(
+        line, float(width - 1), float(height - 1)
+    )
+    if clipped is None:
+        return []
+
+    (x0, y0), (x1, y1) = clipped
+    dx = x1 - x0
+    dy = y1 - y0
+    length = ((dx * dx) + (dy * dy)) ** 0.5
+    if length < 1e-6:
+        return []
+
+    steps = max(2, int(max(abs(dx), abs(dy))) + 2)
+    normal_x = -dy / length
+    normal_y = dx / length
+    width_count = max(1, line_width)
+    pixels: set[Tuple[int, int]] = set()
+
+    for step in range(steps):
+        t = step / (steps - 1)
+        center_x = x0 + dx * t
+        center_y = y0 + dy * t
+        for width_index in range(width_count):
+            offset = width_index - ((width_count - 1) * 0.5)
+            x = int(round(center_x + normal_x * offset))
+            y = int(round(center_y + normal_y * offset))
+            if 0 <= x < width and 0 <= y < height:
+                pixels.add((x, y))
+
+    return list(pixels)
+
+
+def _create_overlay_image(
+        scene: bpy.types.Scene, ndc_line: Line2D) -> Optional[bpy.types.Image]:
     """Create (or update) a transparent image with the eye-level line."""
     settings = scene.elview_settings
     render = scene.render
@@ -470,15 +591,24 @@ def _create_overlay_image(scene: bpy.types.Scene, ndc_y: float) -> Optional[bpy.
     if img_w <= 0 or img_h <= 0:
         return None
 
-    pixel_y: int = int((ndc_y + 1.0) * 0.5 * img_h)
     line_w: int = max(1, int(settings.line_width))
-    r, g, b, a = settings.color[0], settings.color[1], settings.color[2], settings.color[3]
-
-    half: int = line_w // 2
-    y_start: int = max(pixel_y - half, 0)
-    y_end: int = min(pixel_y - half + line_w, img_h)
-    if y_start >= img_h or y_end <= 0:
+    pixel_line: Line2D = (
+        (
+            (ndc_line[0][0] + 1.0) * 0.5 * (img_w - 1),
+            (ndc_line[0][1] + 1.0) * 0.5 * (img_h - 1),
+        ),
+        (
+            (ndc_line[1][0] + 1.0) * 0.5 * (img_w - 1),
+            (ndc_line[1][1] + 1.0) * 0.5 * (img_h - 1),
+        ),
+    )
+    line_pixels = _rasterize_line_pixels(
+        pixel_line, img_w, img_h, line_w
+    )
+    if not line_pixels:
         return None
+
+    r, g, b, a = settings.color[0], settings.color[1], settings.color[2], settings.color[3]
 
     # Reuse or create image
     img_name = _overlay_image_name(scene)
@@ -495,17 +625,17 @@ def _create_overlay_image(scene: bpy.types.Scene, ndc_y: float) -> Optional[bpy.
     try:
         import numpy as np
         px = np.zeros((img_h, img_w, 4), dtype=np.float32)
-        px[y_start:y_end, :] = [r, g, b, a]
+        coordinates = np.asarray(line_pixels, dtype=np.intp)
+        px[coordinates[:, 1], coordinates[:, 0]] = [r, g, b, a]
         img.pixels.foreach_set(px.ravel())
     except Exception:
         px = [0.0] * (img_w * img_h * 4)
-        for y in range(y_start, y_end):
-            for x in range(img_w):
-                idx = (y * img_w + x) * 4
-                px[idx] = r
-                px[idx + 1] = g
-                px[idx + 2] = b
-                px[idx + 3] = a
+        for x, y in line_pixels:
+            idx = (y * img_w + x) * 4
+            px[idx] = r
+            px[idx + 1] = g
+            px[idx + 2] = b
+            px[idx + 3] = a
         img.pixels.foreach_set(px)
 
     img.update()
@@ -702,8 +832,8 @@ def _sync_scene_overlay(scene: bpy.types.Scene) -> None:
             _remove_saved_runtime(scene, restore_use_nodes=True)
         return
 
-    ndc_y = _calc_eye_level_ndc_y_for_render(scene)
-    if ndc_y is None:
+    ndc_line = _calc_eye_level_ndc_line_for_render(scene)
+    if ndc_line is None:
         if _get_compositor_cleanup(scene) is not None:
             _teardown_compositor(scene)
         else:
@@ -712,7 +842,11 @@ def _sync_scene_overlay(scene: bpy.types.Scene) -> None:
 
     render = scene.render
     signature = (
-        round(ndc_y, 9),
+        tuple(
+            round(coordinate, 9)
+            for point in ndc_line
+            for coordinate in point
+        ),
         render.resolution_x,
         render.resolution_y,
         render.resolution_percentage,
@@ -725,7 +859,7 @@ def _sync_scene_overlay(scene: bpy.types.Scene) -> None:
     if info is None:
         _remove_saved_runtime(scene)
 
-    overlay = _create_overlay_image(scene, ndc_y)
+    overlay = _create_overlay_image(scene, ndc_line)
     if overlay is None:
         _teardown_compositor(scene)
         return

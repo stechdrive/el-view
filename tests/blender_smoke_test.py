@@ -10,6 +10,7 @@ from pathlib import Path
 import tempfile
 
 import bpy
+from mathutils import Quaternion
 
 try:
     from _bpy_restrict_state import RestrictBlend
@@ -88,6 +89,47 @@ def assert_red_center_line(image_path):
         bpy.data.images.remove(image)
 
 
+def assert_red_sloped_line(image_path, ndc_line):
+    image = bpy.data.images.load(str(image_path), check_existing=False)
+    try:
+        width, height = image.size
+        pixels = [0.0] * (width * height * 4)
+        image.pixels.foreach_get(pixels)
+        (x0, y0), (x1, y1) = ndc_line
+        assert abs(x1 - x0) > 1e-6, ndc_line
+
+        expected_ys = []
+        for pixel_x in (width // 4, (width * 3) // 4):
+            ndc_x = (2.0 * pixel_x / (width - 1)) - 1.0
+            t = (ndc_x - x0) / (x1 - x0)
+            ndc_y = y0 + (y1 - y0) * t
+            pixel_y = (ndc_y + 1.0) * 0.5 * (height - 1)
+            expected_ys.append(pixel_y)
+
+            samples = []
+            center_x = int(round(pixel_x))
+            center_y = int(round(pixel_y))
+            for y in range(max(0, center_y - 3), min(height, center_y + 4)):
+                for x in range(max(0, center_x - 2), min(width, center_x + 3)):
+                    offset = (y * width + x) * 4
+                    samples.append(pixels[offset:offset + 4])
+            red, green, blue, alpha = max(
+                samples, key=lambda rgba: rgba[0] - rgba[1] - rgba[2]
+            )
+            assert red > 0.8, (
+                pixel_x, pixel_y, red, green, blue, alpha, ndc_line
+            )
+            assert red > green * 2.0 and red > blue * 2.0, (
+                pixel_x, pixel_y, red, green, blue, alpha, ndc_line
+            )
+
+        assert abs(expected_ys[1] - expected_ys[0]) > height * 0.15, (
+            expected_ys, ndc_line
+        )
+    finally:
+        bpy.data.images.remove(image)
+
+
 def main():
     addon = load_addon()
     # Blender extensions are imported and registered with bpy.data/context
@@ -114,7 +156,9 @@ def main():
         tree, original_from, original_to = make_existing_compositor(scene)
         node_count = len(tree.nodes)
         link_count = len(tree.links)
-        overlay = addon._create_overlay_image(scene, 0.0)
+        overlay = addon._create_overlay_image(
+            scene, ((-1.0, 0.0), (1.0, 0.0))
+        )
         assert overlay is not None
         assert addon._inject_compositor_nodes(scene, overlay)
         assert len(tree.nodes) == node_count + 2
@@ -136,7 +180,7 @@ def main():
         assert addon._get_compositor_cleanup(scene) is not None, (
             settings.enable,
             settings.render_overlay,
-            addon._calc_eye_level_ndc_y_for_render(scene),
+            addon._calc_eye_level_ndc_line_for_render(scene),
         )
         output_path = Path(tempfile.gettempdir()) / (
             f"el_view_smoke_{bpy.app.version[0]}_{bpy.app.version[1]}.png"
@@ -146,6 +190,30 @@ def main():
         assert output_path.exists()
         assert_red_center_line(output_path)
         assert addon._get_compositor_cleanup(scene) is not None
+
+        # Rolling around the camera's viewing axis must tilt the world horizon
+        # in both the shared projection and the rendered overlay.
+        camera = scene.camera
+        base_rotation = camera.rotation_euler.to_quaternion()
+        camera.rotation_mode = 'QUATERNION'
+        camera.rotation_quaternion = (
+            base_rotation @
+            Quaternion((0.0, 0.0, 1.0), math.radians(30.0))
+        )
+        bpy.context.view_layer.update()
+        ndc_line = addon._calc_eye_level_ndc_line_for_render(scene)
+        assert ndc_line is not None
+        assert abs(ndc_line[1][1] - ndc_line[0][1]) > 0.1, ndc_line
+        addon._sync_scene_overlay(scene)
+
+        rolled_output_path = Path(tempfile.gettempdir()) / (
+            f"el_view_smoke_roll_{bpy.app.version[0]}_"
+            f"{bpy.app.version[1]}.png"
+        )
+        scene.render.filepath = str(rolled_output_path)
+        bpy.ops.render.render(write_still=True)
+        assert rolled_output_path.exists()
+        assert_red_sloped_line(rolled_output_path, ndc_line)
 
         # Reopening an enabled file must replace, not duplicate, runtime nodes.
         addon._comp_cleanups.clear()
